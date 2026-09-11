@@ -1,4 +1,4 @@
-# Project Ironmind - Trading Journal & R-Multiple Tracker
+#Trading Journal & R-Multiple Tracker
 
 A GUI-based trading journal that tracks your balance, R-multiples, and progress toward financial goals.
 
