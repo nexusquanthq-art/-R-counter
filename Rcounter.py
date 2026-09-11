@@ -11,9 +11,11 @@ from tkinter import messagebox, ttk
 DATA_FILE = "trading_tracker.json"
 RISK_PERCENT = 0.05          # 1R = 5%
 DEFAULT_BALANCE = 100
+LIQUIDATION_THRESHOLD = 0.01 # liquidated if balance < 1% of initial
+MAX_R = 10000                # hard cap to prevent overflow
 
 # ----------------------------------------------------------------------
-# Data handling (same as CLI)
+# Data handling
 # ----------------------------------------------------------------------
 def load_data():
     if not os.path.exists(DATA_FILE):
@@ -24,6 +26,9 @@ def load_data():
     required = {"balance", "total_R", "trades"}
     if not required.issubset(data.keys()):
         raise ValueError("Corrupted data file.")
+    # Migration: add initial_balance if missing
+    if "initial_balance" not in data:
+        data["initial_balance"] = data["balance"]
     return data
 
 def save_data(data):
@@ -35,6 +40,7 @@ def save_data(data):
 def init_new_data(balance):
     data = {
         "balance": balance,
+        "initial_balance": balance,
         "total_R": 0,
         "target": None,
         "trades": []
@@ -51,16 +57,18 @@ class IronmindApp:
         self.root.title("Project Ironmind")
         self.root.resizable(False, False)
 
-        # Load data or init
         self.data = load_data()
         if self.data is None:
             self.first_run_setup()
         else:
             self.build_ui()
 
+    # ------------------------------------------------------------------
+    # First-run setup
+    # ------------------------------------------------------------------
     def first_run_setup(self):
         """Pop up a dialog to set initial balance."""
-        self.root.withdraw()  # hide main window temporarily
+        self.root.withdraw()
         dialog = tk.Toplevel()
         dialog.title("Welcome")
         tk.Label(dialog, text="No data found. Enter initial balance:").pack(padx=10, pady=5)
@@ -87,12 +95,14 @@ class IronmindApp:
         dialog.protocol("WM_DELETE_WINDOW", lambda: self.root.quit())
         dialog.grab_set()
         self.root.wait_window(dialog)
-        if self.data is None:   # closed manually
+        if self.data is None:
             self.root.quit()
 
+    # ------------------------------------------------------------------
+    # UI
+    # ------------------------------------------------------------------
     def build_ui(self):
         """Construct the main interface."""
-        # Header / Dashboard
         self.balance_var = tk.StringVar()
         self.totalR_var = tk.StringVar()
         self.target_var = tk.StringVar(value="Not set")
@@ -112,7 +122,6 @@ class IronmindApp:
 
         self.refresh_dashboard()
 
-        # Action buttons
         frame_actions = ttk.Frame(self.root, padding=10)
         frame_actions.pack(fill="x", padx=10, pady=5)
 
@@ -131,6 +140,8 @@ class IronmindApp:
             self.target_var.set(f"${target:,.2f}")
             if bal >= target:
                 self.Rneeded_var.set("Goal reached! 🎉")
+            elif bal <= 0:
+                self.Rneeded_var.set("Liquidated 💀")
             else:
                 R_needed = math.ceil(math.log(target / bal) / math.log(1 + RISK_PERCENT))
                 self.Rneeded_var.set(str(R_needed))
@@ -138,6 +149,9 @@ class IronmindApp:
             self.target_var.set("Not set")
             self.Rneeded_var.set("—")
 
+    # ------------------------------------------------------------------
+    # Trade logging
+    # ------------------------------------------------------------------
     def log_trade(self):
         """Open a dialog to log a trade."""
         dialog = tk.Toplevel(self.root)
@@ -160,7 +174,41 @@ class IronmindApp:
             rounded_R = int(round(raw_R))
 
             old_balance = self.data["balance"]
-            new_balance = old_balance * (1 + rounded_R * RISK_PERCENT)
+            initial = self.data.get("initial_balance", old_balance)
+
+            # ---- OVERFLOW GUARD ----
+            if abs(rounded_R) > MAX_R:
+                messagebox.showerror(
+                    "Input Too Large",
+                    f"The R value ({rounded_R}R) is too large to compute.\n"
+                    f"Maximum allowed is {MAX_R}R.",
+                    parent=dialog
+                )
+                return
+
+            # ---- COMPOUNDING MATH ----
+            try:
+                if rounded_R >= 0:
+                    new_balance = old_balance * ((1 + RISK_PERCENT) ** rounded_R)
+                else:
+                    new_balance = old_balance * ((1 - RISK_PERCENT) ** abs(rounded_R))
+            except OverflowError:
+                messagebox.showerror(
+                    "Number Too Large",
+                    "The result is too large to compute.\n"
+                    "Try a smaller percentage.",
+                    parent=dialog
+                )
+                return
+            # --------------------------
+
+            # ---- LIQUIDATION CHECK: below 1% of initial ----
+            liquidated = False
+            if new_balance < LIQUIDATION_THRESHOLD * initial:
+                new_balance = 0
+                liquidated = True
+            # -----------------------------------------------
+
             self.data["balance"] = new_balance
             self.data["total_R"] += rounded_R
 
@@ -175,12 +223,118 @@ class IronmindApp:
 
             self.refresh_dashboard()
             dialog.destroy()
-            messagebox.showinfo("Trade Logged", f"{pct}% → {rounded_R}R\nNew balance: ${new_balance:,.2f}")
+
+            if liquidated:
+                self.handle_liquidation()
+            else:
+                messagebox.showinfo(
+                    "Trade Logged",
+                    f"{pct}% → {rounded_R}R\nNew balance: ${new_balance:,.2f}"
+                )
 
         ttk.Button(dialog, text="Submit", command=submit).pack(pady=5)
         dialog.grab_set()
         self.root.wait_window(dialog)
 
+    # ------------------------------------------------------------------
+    # Liquidation handling
+    # ------------------------------------------------------------------
+    def handle_liquidation(self):
+        """Ask user what to do after liquidation."""
+        choice_win = tk.Toplevel(self.root)
+        choice_win.title("You Got Liquidated 💀")
+        choice_win.resizable(False, False)
+        choice_win.grab_set()
+
+        msg = (
+            "You got liquidated.\n\n"
+            "Your balance has hit zero.\n\n"
+            "What do you want to do?"
+        )
+        tk.Label(choice_win, text=msg, justify="center", padx=20, pady=15).pack()
+
+        btn_frame = ttk.Frame(choice_win, padding=10)
+        btn_frame.pack(fill="x")
+
+        def start_over():
+            choice_win.destroy()
+            self.reset_all_data()
+
+        def add_balance():
+            choice_win.destroy()
+            self.add_new_balance()
+
+        ttk.Button(btn_frame, text="Start Over (delete all data)", command=start_over).pack(fill="x", pady=3)
+        ttk.Button(btn_frame, text="Add New Balance (keep history)", command=add_balance).pack(fill="x", pady=3)
+
+        choice_win.protocol("WM_DELETE_WINDOW", lambda: None)  # force a choice
+        self.root.wait_window(choice_win)
+
+    def reset_all_data(self):
+        """Delete all data and ask for new balance."""
+        if os.path.exists(DATA_FILE):
+            os.remove(DATA_FILE)
+        self.data = None
+
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Start Over")
+        tk.Label(dialog, text="Enter new starting balance:").pack(padx=10, pady=5)
+        entry = tk.Entry(dialog)
+        entry.insert(0, str(DEFAULT_BALANCE))
+        entry.pack(padx=10, pady=5)
+        entry.focus()
+
+        def on_ok():
+            try:
+                bal = float(entry.get())
+                if bal <= 0:
+                    messagebox.showerror("Error", "Balance must be positive.")
+                    return
+            except ValueError:
+                messagebox.showerror("Error", "Invalid number.")
+                return
+            dialog.destroy()
+            self.data = init_new_data(bal)
+            self.refresh_dashboard()
+            messagebox.showinfo("Fresh Start", f"New balance: ${bal:,.2f}")
+
+        ttk.Button(dialog, text="OK", command=on_ok).pack(pady=5)
+        dialog.grab_set()
+        self.root.wait_window(dialog)
+
+    def add_new_balance(self):
+        """Add a new balance on top of existing data, keep history."""
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Add New Balance")
+        tk.Label(dialog, text="Enter new balance to continue:").pack(padx=10, pady=5)
+        entry = tk.Entry(dialog)
+        entry.insert(0, str(DEFAULT_BALANCE))
+        entry.pack(padx=10, pady=5)
+        entry.focus()
+
+        def on_ok():
+            try:
+                bal = float(entry.get())
+                if bal <= 0:
+                    messagebox.showerror("Error", "Balance must be positive.")
+                    return
+            except ValueError:
+                messagebox.showerror("Error", "Invalid number.")
+                return
+            dialog.destroy()
+            self.data["balance"] = bal
+            self.data["initial_balance"] = bal  # reset the 1% baseline
+            save_data(self.data)
+            self.refresh_dashboard()
+            messagebox.showinfo("Balance Added", f"New balance: ${bal:,.2f}\nHistory kept.")
+
+        ttk.Button(dialog, text="OK", command=on_ok).pack(pady=5)
+        dialog.grab_set()
+        self.root.wait_window(dialog)
+
+    # ------------------------------------------------------------------
+    # Target
+    # ------------------------------------------------------------------
     def set_target(self):
         """Open a dialog to set a financial target."""
         dialog = tk.Toplevel(self.root)
@@ -198,6 +352,9 @@ class IronmindApp:
             except ValueError:
                 messagebox.showerror("Invalid Input", "Enter a valid number.", parent=dialog)
                 return
+            if self.data["balance"] <= 0:
+                messagebox.showerror("Error", "Balance is zero. Can't set target.", parent=dialog)
+                return
             if target <= self.data["balance"]:
                 messagebox.showerror("Error", "Target must be greater than current balance.", parent=dialog)
                 return
@@ -206,7 +363,6 @@ class IronmindApp:
             save_data(self.data)
             self.refresh_dashboard()
             dialog.destroy()
-            # Show a quick info
             R_needed = math.ceil(math.log(target / self.data["balance"]) / math.log(1 + RISK_PERCENT))
             messagebox.showinfo("Target Set", f"Target: ${target:,.2f}\nR needed: {R_needed}")
 
@@ -214,6 +370,9 @@ class IronmindApp:
         dialog.grab_set()
         self.root.wait_window(dialog)
 
+    # ------------------------------------------------------------------
+    # History
+    # ------------------------------------------------------------------
     def view_history(self):
         """Show a window with the trade history table."""
         trades = self.data["trades"]
@@ -224,7 +383,6 @@ class IronmindApp:
         hist_win = tk.Toplevel(self.root)
         hist_win.title("Trade History")
         hist_win.geometry("550x300")
-        # Treeview table
         columns = ("date", "pl", "R", "balance")
         tree = ttk.Treeview(hist_win, columns=columns, show="headings")
         tree.heading("date", text="Date")
@@ -244,9 +402,7 @@ class IronmindApp:
             tree.insert("", "end", values=(ts, pl, R, bal))
 
         tree.pack(fill="both", expand=True, padx=5, pady=5)
-
-        close_btn = ttk.Button(hist_win, text="Close", command=hist_win.destroy)
-        close_btn.pack(pady=5)
+        ttk.Button(hist_win, text="Close", command=hist_win.destroy).pack(pady=5)
 
 # ----------------------------------------------------------------------
 # Main
